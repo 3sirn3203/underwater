@@ -1,0 +1,70 @@
+{
+  "categorical_features": [
+    "hydrogeology",
+    "aquifer",
+    "water_quality_type"
+  ],
+  "numerical_features": [
+    "mean_well_depth",
+    "drought_vulnerability",
+    "mean_pumped_volume_per_day",
+    "mean_natural_water_level",
+    "mean_stable_water_level",
+    "mean_storage_coef"
+  ],
+  "ohe_categories": [
+    [
+      "a",
+      "b",
+      "c",
+      "d",
+      "e-1",
+      "e-2",
+      "f",
+      "g",
+      "h-1",
+      "h-2",
+      "수류지역"
+    ],
+    [
+      "샘물",
+      "암반",
+      "용천수",
+      "지표수",
+      "충적"
+    ],
+    [
+      "-1",
+      "0",
+      "1",
+      "11",
+      "16",
+      "17",
+      "18",
+      "19",
+      "3",
+      "4",
+      "41",
+      "5",
+      "64",
+      "8"
+    ]
+  ],
+  "scaler_mean": [
+    61.97339150227617,
+    1.028072837632777,
+    128.0855690440061,
+    4.017761760242792,
+    15.590796661608497,
+    0.295144157814871
+  ],
+  "scaler_scale": [
+    58.900779915150856,
+    0.7245747562506863,
+    126.01618183455747,
+    4.232472981555811,
+    20.57533091062127,
+    0.4561075354810766
+  ],
+  "base_score_logodds": -2.187148925347478
+}

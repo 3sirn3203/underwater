@@ -1,0 +1,12 @@
+pandas
+numpy
+matplotlib
+openpyxl
+geopandas
+shapely
+scikit-learn
+xgboost
+umap-learn
+scikit-optimize
+shap
+scipy
