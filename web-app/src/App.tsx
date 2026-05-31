@@ -1,10 +1,21 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { MapContainer, TileLayer, CircleMarker, useMap } from 'react-leaflet';
-import { 
-  Search, Sliders, Info, Cpu, MapPin, RefreshCw, BarChart2, Filter, Droplet, Sparkles, X
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
+import * as L from 'leaflet';
+import { CircleMarker, MapContainer, TileLayer, useMap, useMapEvents, ZoomControl } from 'react-leaflet';
+import {
+  BarChart2,
+  Check,
+  ChevronDown,
+  Cpu,
+  Droplet,
+  Filter,
+  Info,
+  MapPin,
+  RefreshCw,
+  Search,
+  Sliders,
+  X,
 } from 'lucide-react';
-import confetti from 'canvas-confetti';
-import wellsDataRaw from './data/wells_data.json';
+import modelConfig from './model/model_config.json';
 import { predictSuitability } from './model/predict';
 
 interface Well {
@@ -15,7 +26,7 @@ interface Well {
   town: string;
   lat: number;
   lng: number;
-  is_dev: number; // -1: Unknown, 0: Unsuitable, 1: Suitable
+  is_dev: number;
   prob: number;
   pred: number;
   depth: number;
@@ -29,711 +40,1189 @@ interface Well {
   aquifer: string;
 }
 
-const wellsData: Well[] = wellsDataRaw as Well[];
+interface PredictInput {
+  hydrogeology: string;
+  aquifer: string;
+  water_quality_type: string;
+  mean_well_depth: number;
+  drought_vulnerability: number;
+  mean_pumped_volume_per_day: number;
+  mean_natural_water_level: number;
+  mean_stable_water_level: number;
+  mean_storage_coef: number;
+}
 
-// Map view controller
-function ChangeView({ center, zoom }: { center: [number, number]; zoom: number }) {
-  const map = useMap();
-  useEffect(() => {
-    if (center[0] !== 0 && center[1] !== 0) {
-      map.setView(center, zoom, { animate: true, duration: 1.2 });
+interface ImpactRow {
+  key: keyof PredictInput;
+  label: string;
+  unit: string;
+  delta: number;
+  baselineText: string;
+}
+
+type LoadState = 'loading' | 'ready' | 'error';
+type SuitabilityFilter = 'all' | 'suitable' | 'unsuitable' | 'actual-suitable' | 'unknown';
+type DisplayMode = 'density' | 'priority' | 'points';
+type FilterDropdownId = 'province' | 'suitability';
+
+interface ClusterPoint {
+  id: string;
+  lat: number;
+  lng: number;
+  count: number;
+  suitable: number;
+  actualSuitable: number;
+  avgProb: number;
+  maxProb: number;
+  label: string;
+}
+
+interface DropdownOption<T extends string> {
+  value: T;
+  label: string;
+  meta?: string;
+}
+
+const DATA_URL = '/data/wells_data.json';
+const INITIAL_CENTER: [number, number] = [36.25, 127.85];
+const INITIAL_ZOOM = 7;
+const OHE_CATEGORIES = modelConfig.ohe_categories as string[][];
+const NUMERICAL_MEANS = modelConfig.scaler_mean as number[];
+
+const DEFAULT_INPUT: PredictInput = {
+  hydrogeology: 'f',
+  aquifer: '충적',
+  water_quality_type: '0',
+  mean_well_depth: Math.round(NUMERICAL_MEANS[0]),
+  drought_vulnerability: 3,
+  mean_pumped_volume_per_day: Math.round(NUMERICAL_MEANS[2]),
+  mean_natural_water_level: Math.round(NUMERICAL_MEANS[3]),
+  mean_stable_water_level: Math.round(NUMERICAL_MEANS[4]),
+  mean_storage_coef: 1,
+};
+
+const FILTER_OPTIONS: Array<{ value: SuitabilityFilter; label: string }> = [
+  { value: 'all', label: '전체 후보지' },
+  { value: 'suitable', label: '적합 예측' },
+  { value: 'unsuitable', label: '부적합 예측' },
+  { value: 'actual-suitable', label: '실제 적합 라벨' },
+  { value: 'unknown', label: '미판정 예측 대상' },
+];
+
+const FILTER_META: Record<SuitabilityFilter, string> = {
+  all: '모든 후보 표시',
+  suitable: '모델이 적합으로 본 지점',
+  unsuitable: '모델이 부적합으로 본 지점',
+  'actual-suitable': '라벨 데이터 기준',
+  unknown: '예측 대상 미라벨 지점',
+};
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
+function formatNumber(value: number, digits = 1) {
+  return new Intl.NumberFormat('ko-KR', {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: digits,
+  }).format(value);
+}
+
+function getLabelText(well: Well) {
+  if (well.is_dev === 1) return '실제 적합';
+  if (well.is_dev === 0) return '실제 부적합';
+  return well.pred === 1 ? '예측 적합' : '예측 부적합';
+}
+
+function getMarkerStyle(well: Well): L.CircleMarkerOptions {
+  if (well.is_dev === 1) {
+    return { color: '#047857', fillColor: '#10b981', fillOpacity: 0.86, weight: 1.2 };
+  }
+
+  if (well.is_dev === 0) {
+    return { color: '#dc2626', fillColor: '#fb7185', fillOpacity: 0.8, weight: 1.1 };
+  }
+
+  if (well.prob >= 0.7) {
+    return { color: '#0f766e', fillColor: '#2dd4bf', fillOpacity: 0.78, weight: 0.7 };
+  }
+
+  if (well.prob >= 0.5) {
+    return { color: '#0891b2', fillColor: '#67e8f9', fillOpacity: 0.72, weight: 0.65 };
+  }
+
+  if (well.prob >= 0.3) {
+    return { color: '#d97706', fillColor: '#fbbf24', fillOpacity: 0.62, weight: 0.55 };
+  }
+
+  return { color: '#e11d48', fillColor: '#fda4af', fillOpacity: 0.56, weight: 0.5 };
+}
+
+function getPointRadius(zoom: number) {
+  if (zoom >= 12) return 6;
+  if (zoom >= 10) return 4.6;
+  if (zoom >= 8) return 3.4;
+  return 2.6;
+}
+
+function getDisplayMode(zoom: number, filteredCount: number): DisplayMode {
+  if (zoom >= 11 || filteredCount <= 1800) return 'points';
+  if (zoom >= 8) return 'priority';
+  return 'density';
+}
+
+function getDisplayModeLabel(mode: DisplayMode) {
+  if (mode === 'density') return '밀도 집계';
+  if (mode === 'priority') return '중요 후보';
+  return '개별 지점';
+}
+
+function getClusterBinSize(zoom: number) {
+  if (zoom < 7) return 0.58;
+  return 0.36;
+}
+
+function getPriorityBinSize(zoom: number) {
+  if (zoom < 9) return 0.1;
+  return 0.065;
+}
+
+function isPriorityWell(well: Well) {
+  return well.pred === 1 || well.is_dev !== -1 || well.prob >= 0.45;
+}
+
+function getCellKey(lat: number, lng: number, binSize: number) {
+  return `${Math.floor(lat / binSize)}:${Math.floor(lng / binSize)}`;
+}
+
+function buildClusterPoints(wells: Well[], zoom: number): ClusterPoint[] {
+  const binSize = getClusterBinSize(zoom);
+  const buckets = new Map<
+    string,
+    {
+      latSum: number;
+      lngSum: number;
+      probSum: number;
+      count: number;
+      suitable: number;
+      actualSuitable: number;
+      maxProb: number;
+      label: string;
     }
-  }, [center, zoom, map]);
+  >();
+
+  wells.forEach((well) => {
+    const key = getCellKey(well.lat, well.lng, binSize);
+    const bucket = buckets.get(key);
+
+    if (bucket) {
+      bucket.latSum += well.lat;
+      bucket.lngSum += well.lng;
+      bucket.probSum += well.prob;
+      bucket.count += 1;
+      bucket.suitable += well.pred === 1 ? 1 : 0;
+      bucket.actualSuitable += well.is_dev === 1 ? 1 : 0;
+      if (well.prob > bucket.maxProb) {
+        bucket.maxProb = well.prob;
+        bucket.label = [well.prov, well.city].filter(Boolean).join(' ');
+      }
+      return;
+    }
+
+    buckets.set(key, {
+      latSum: well.lat,
+      lngSum: well.lng,
+      probSum: well.prob,
+      count: 1,
+      suitable: well.pred === 1 ? 1 : 0,
+      actualSuitable: well.is_dev === 1 ? 1 : 0,
+      maxProb: well.prob,
+      label: [well.prov, well.city].filter(Boolean).join(' '),
+    });
+  });
+
+  return Array.from(buckets.entries()).map(([id, bucket]) => ({
+    id,
+    lat: bucket.latSum / bucket.count,
+    lng: bucket.lngSum / bucket.count,
+    count: bucket.count,
+    suitable: bucket.suitable,
+    actualSuitable: bucket.actualSuitable,
+    avgProb: bucket.probSum / bucket.count,
+    maxProb: bucket.maxProb,
+    label: bucket.label,
+  }));
+}
+
+function buildPriorityWells(wells: Well[], zoom: number) {
+  const binSize = getPriorityBinSize(zoom);
+  const selected = new Map<number, Well>();
+  const representativeByCell = new Map<string, Well>();
+
+  wells.forEach((well) => {
+    if (isPriorityWell(well)) {
+      selected.set(well.id, well);
+      return;
+    }
+
+    const key = getCellKey(well.lat, well.lng, binSize);
+    const current = representativeByCell.get(key);
+    if (!current || well.prob > current.prob) {
+      representativeByCell.set(key, well);
+    }
+  });
+
+  representativeByCell.forEach((well) => {
+    if (!selected.has(well.id)) {
+      selected.set(well.id, well);
+    }
+  });
+
+  return Array.from(selected.values()).sort((a, b) => b.prob - a.prob);
+}
+
+function getClusterStyle(cluster: ClusterPoint): L.CircleMarkerOptions {
+  const ratio = cluster.count > 0 ? cluster.suitable / cluster.count : 0;
+  const radius = Math.max(8, Math.min(28, 6 + Math.sqrt(cluster.count) * 1.15));
+
+  if (ratio >= 0.35 || cluster.maxProb >= 0.7) {
+    return {
+      radius,
+      color: '#047857',
+      fillColor: '#10b981',
+      fillOpacity: 0.38,
+      weight: 1.3,
+    };
+  }
+
+  if (ratio >= 0.12 || cluster.maxProb >= 0.5) {
+    return {
+      radius,
+      color: '#0891b2',
+      fillColor: '#67e8f9',
+      fillOpacity: 0.34,
+      weight: 1.2,
+    };
+  }
+
+  return {
+    radius,
+    color: '#d97706',
+    fillColor: '#fbbf24',
+    fillOpacity: 0.3,
+    weight: 1,
+  };
+}
+
+function buildTooltipHtml(well: Well) {
+  const location = [well.prov, well.city, well.town].filter(Boolean).join(' ');
+  return `
+    <div class="well-tooltip-card">
+      <div class="well-tooltip-title">${escapeHtml(well.name || `후보지 #${well.id}`)}</div>
+      <div class="well-tooltip-location">${escapeHtml(location)}</div>
+      <div class="well-tooltip-meta">
+        <span>${escapeHtml(getLabelText(well))}</span>
+        <strong>${formatPercent(well.prob)}</strong>
+      </div>
+    </div>
+  `;
+}
+
+function buildClusterTooltipHtml(cluster: ClusterPoint) {
+  const suitableRatio = cluster.count > 0 ? cluster.suitable / cluster.count : 0;
+
+  return `
+    <div class="well-tooltip-card">
+      <div class="well-tooltip-title">${escapeHtml(cluster.label || '집계 영역')}</div>
+      <div class="well-tooltip-location">${cluster.count.toLocaleString()}개 후보지 집계</div>
+      <div class="well-tooltip-meta">
+        <span>적합 예측 ${cluster.suitable.toLocaleString()}개</span>
+        <strong>${formatPercent(suitableRatio)}</strong>
+      </div>
+      <div class="well-tooltip-note">평균 ${formatPercent(cluster.avgProb)} · 최고 ${formatPercent(cluster.maxProb)}</div>
+    </div>
+  `;
+}
+
+function getInputFromWell(well: Well): PredictInput {
+  return {
+    hydrogeology: well.hydro || DEFAULT_INPUT.hydrogeology,
+    aquifer: well.aquifer || DEFAULT_INPUT.aquifer,
+    water_quality_type: String(well.wq_type),
+    mean_well_depth: Math.round(well.depth),
+    drought_vulnerability: well.drought || DEFAULT_INPUT.drought_vulnerability,
+    mean_pumped_volume_per_day: Math.round(well.pump),
+    mean_natural_water_level: Math.round(well.nat_lvl),
+    mean_stable_water_level: Math.round(well.stab_lvl),
+    mean_storage_coef: well.storage,
+  };
+}
+
+function calculateImpactRows(input: PredictInput, probability: number): ImpactRow[] {
+  const baselines: Array<{
+    key: keyof PredictInput;
+    label: string;
+    unit: string;
+    value: string | number;
+    baselineText: string;
+  }> = [
+    { key: 'hydrogeology', label: '수문지질', unit: '', value: DEFAULT_INPUT.hydrogeology, baselineText: DEFAULT_INPUT.hydrogeology },
+    { key: 'aquifer', label: '대수층', unit: '', value: DEFAULT_INPUT.aquifer, baselineText: `${DEFAULT_INPUT.aquifer}층` },
+    { key: 'water_quality_type', label: '수질 군집', unit: '', value: DEFAULT_INPUT.water_quality_type, baselineText: `유형 ${DEFAULT_INPUT.water_quality_type}` },
+    { key: 'mean_well_depth', label: '관정 깊이', unit: 'm', value: NUMERICAL_MEANS[0], baselineText: `${formatNumber(NUMERICAL_MEANS[0])} m` },
+    { key: 'drought_vulnerability', label: '가뭄 등급', unit: '등급', value: NUMERICAL_MEANS[1], baselineText: `${formatNumber(NUMERICAL_MEANS[1])} 등급` },
+    { key: 'mean_pumped_volume_per_day', label: '평균 양수량', unit: 'm³/d', value: NUMERICAL_MEANS[2], baselineText: `${formatNumber(NUMERICAL_MEANS[2])} m³/d` },
+    { key: 'mean_natural_water_level', label: '자연수위', unit: 'm', value: NUMERICAL_MEANS[3], baselineText: `${formatNumber(NUMERICAL_MEANS[3])} m` },
+    { key: 'mean_stable_water_level', label: '안정수위', unit: 'm', value: NUMERICAL_MEANS[4], baselineText: `${formatNumber(NUMERICAL_MEANS[4])} m` },
+    { key: 'mean_storage_coef', label: '저류계수 측정', unit: '', value: NUMERICAL_MEANS[5], baselineText: `평균 ${formatNumber(NUMERICAL_MEANS[5])}` },
+  ];
+
+  return baselines
+    .map((baseline) => {
+      const mutedInput = { ...input, [baseline.key]: baseline.value } as PredictInput;
+      const mutedProbability = predictSuitability(mutedInput).probability;
+      return {
+        key: baseline.key,
+        label: baseline.label,
+        unit: baseline.unit,
+        delta: probability - mutedProbability,
+        baselineText: baseline.baselineText,
+      };
+    })
+    .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+}
+
+function ChangeView({ selectedWell }: { selectedWell: Well | null }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!selectedWell) return;
+    map.flyTo([selectedWell.lat, selectedWell.lng], Math.max(map.getZoom(), 12), {
+      animate: true,
+      duration: 0.85,
+    });
+  }, [map, selectedWell]);
+
+  return null;
+}
+
+function MapZoomReporter({ onZoomChange }: { onZoomChange: (zoom: number) => void }) {
+  const map = useMapEvents({
+    zoomend: () => {
+      onZoomChange(map.getZoom());
+    },
+  });
+
+  useEffect(() => {
+    onZoomChange(map.getZoom());
+  }, [map, onZoomChange]);
+
+  return null;
+}
+
+function FilterDropdown<T extends string>({
+  id,
+  label,
+  icon,
+  value,
+  options,
+  openDropdown,
+  onOpenChange,
+  onChange,
+}: {
+  id: FilterDropdownId;
+  label: string;
+  icon: ReactNode;
+  value: T;
+  options: DropdownOption<T>[];
+  openDropdown: FilterDropdownId | null;
+  onOpenChange: (id: FilterDropdownId | null) => void;
+  onChange: (value: T) => void;
+}) {
+  const isOpen = openDropdown === id;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selectedOption = options.find((option) => option.value === value) ?? options[0];
+  const buttonId = `${id}-dropdown-button`;
+  const listboxId = `${id}-dropdown-listbox`;
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        onOpenChange(null);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onOpenChange(null);
+      }
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isOpen, onOpenChange]);
+
+  return (
+    <div className={`dropdown-shell ${isOpen ? 'is-open' : ''}`} ref={rootRef}>
+      <button
+        id={buttonId}
+        type="button"
+        className="dropdown-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={isOpen}
+        aria-controls={listboxId}
+        onClick={() => onOpenChange(isOpen ? null : id)}
+      >
+        <span className="dropdown-icon">{icon}</span>
+        <span className="dropdown-copy">
+          <span>{label}</span>
+          <strong>{selectedOption.label}</strong>
+        </span>
+        <ChevronDown size={16} className="dropdown-chevron" />
+      </button>
+
+      {isOpen && (
+        <div className="dropdown-menu" role="listbox" id={listboxId} aria-labelledby={buttonId}>
+          {options.map((option) => {
+            const selected = option.value === value;
+
+            return (
+              <button
+                key={option.value}
+                type="button"
+                className={`dropdown-option ${selected ? 'is-selected' : ''}`}
+                role="option"
+                aria-selected={selected}
+                onClick={() => {
+                  onChange(option.value);
+                  onOpenChange(null);
+                }}
+              >
+                <span className="option-text">
+                  <strong>{option.label}</strong>
+                  {option.meta && <small>{option.meta}</small>}
+                </span>
+                {selected && <Check size={16} />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ClusterCanvasLayer({ clusters }: { clusters: ClusterPoint[] }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (clusters.length === 0) return;
+
+    const renderer = L.canvas({ padding: 0.5 });
+    const layerGroup = L.layerGroup().addTo(map);
+
+    clusters.forEach((cluster) => {
+      const marker = L.circleMarker([cluster.lat, cluster.lng], {
+        ...getClusterStyle(cluster),
+        renderer,
+        bubblingMouseEvents: false,
+      });
+
+      marker.bindTooltip(buildClusterTooltipHtml(cluster), {
+        className: 'well-tooltip-shell',
+        direction: 'top',
+        opacity: 1,
+        offset: L.point(0, -12),
+        sticky: true,
+      });
+
+      marker.on('click', () => {
+        map.flyTo([cluster.lat, cluster.lng], Math.max(map.getZoom() + 2, 9), {
+          animate: true,
+          duration: 0.7,
+        });
+      });
+
+      marker.addTo(layerGroup);
+    });
+
+    return () => {
+      layerGroup.remove();
+      renderer.remove();
+    };
+  }, [clusters, map]);
+
+  return null;
+}
+
+function WellCanvasLayer({
+  wells,
+  onSelect,
+}: {
+  wells: Well[];
+  onSelect: (well: Well) => void;
+}) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (wells.length === 0) return;
+
+    const renderer = L.canvas({ padding: 0.5 });
+    const layerGroup = L.layerGroup().addTo(map);
+    const radius = getPointRadius(map.getZoom());
+
+    wells.forEach((well) => {
+      const marker = L.circleMarker([well.lat, well.lng], {
+        ...getMarkerStyle(well),
+        radius,
+        renderer,
+        bubblingMouseEvents: false,
+      });
+
+      marker.bindTooltip(buildTooltipHtml(well), {
+        className: 'well-tooltip-shell',
+        direction: 'top',
+        opacity: 1,
+        offset: L.point(0, -8),
+        sticky: true,
+      });
+
+      marker.on('click', () => onSelect(well));
+      marker.addTo(layerGroup);
+    });
+
+    const handleZoomEnd = () => {
+      const nextRadius = getPointRadius(map.getZoom());
+      layerGroup.eachLayer((layer) => {
+        if (layer instanceof L.CircleMarker) {
+          layer.setRadius(nextRadius);
+        }
+      });
+    };
+
+    map.on('zoomend', handleZoomEnd);
+
+    return () => {
+      map.off('zoomend', handleZoomEnd);
+      layerGroup.remove();
+      renderer.remove();
+    };
+  }, [map, onSelect, wells]);
+
   return null;
 }
 
 export default function App() {
-  // States
+  const [wells, setWells] = useState<Well[]>([]);
+  const [loadState, setLoadState] = useState<LoadState>('loading');
+  const [loadError, setLoadError] = useState('');
   const [selectedWell, setSelectedWell] = useState<Well | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [provinceFilter, setProvinceFilter] = useState('전체');
-  const [suitabilityFilter, setSuitabilityFilter] = useState('전체');
-  
-  // Map Position
-  const [mapCenter, setMapCenter] = useState<[number, number]>([36.2, 127.8]);
-  const [mapZoom, setMapZoom] = useState(7.5);
-
-  // Simulator Form States
-  const [simHydro, setSimHydro] = useState('f');
-  const [simAquifer, setSimAquifer] = useState('충적');
-  const [simWqType, setSimWqType] = useState('0');
-  const [simDepth, setSimDepth] = useState(55);
-  const [simDrought, setSimDrought] = useState(3);
-  const [simPump, setSimPump] = useState(200);
-  const [simNatLvl, setSimNatLvl] = useState(12);
-  const [simStabLvl, setSimStabLvl] = useState(15);
-  const [simStorage, setSimStorage] = useState(1);
-
-  // Simulation Pred State
-  const [predProbability, setPredProbability] = useState<number | null>(null);
-  const [predLabel, setPredLabel] = useState<number | null>(null);
-  const [isSimulating, setIsSimulating] = useState(false);
-
-  // Filter unique provinces
-  const provinces = useMemo(() => {
-    const set = new Set(wellsData.map(w => w.prov).filter(Boolean));
-    return ['전체', ...Array.from(set).sort()];
-  }, []);
-
-  // Filter wells
-  const filteredWells = useMemo(() => {
-    return wellsData.filter(well => {
-      const matchesSearch = 
-        well.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        well.city.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        well.town.toLowerCase().includes(searchQuery.toLowerCase());
-      
-      const matchesProv = provinceFilter === '전체' || well.prov === provinceFilter;
-      
-      let matchesSuit = true;
-      if (suitabilityFilter === '적합') {
-        matchesSuit = well.is_dev === 1 || (well.is_dev === -1 && well.pred === 1);
-      } else if (suitabilityFilter === '부적합') {
-        matchesSuit = well.is_dev === 0 || (well.is_dev === -1 && well.pred === 0);
-      } else if (suitabilityFilter === '실제적합') {
-        matchesSuit = well.is_dev === 1;
-      } else if (suitabilityFilter === '미판정') {
-        matchesSuit = well.is_dev === -1;
-      }
-
-      return matchesSearch && matchesProv && matchesSuit;
-    });
-  }, [searchQuery, provinceFilter, suitabilityFilter]);
-
-  // Load selected well parameters into simulator sandbox
-  const loadWellIntoSimulator = (well: Well) => {
-    setSimHydro(well.hydro || 'f');
-    setSimAquifer(well.aquifer || '충적');
-    setSimWqType(String(well.wq_type));
-    setSimDepth(Math.round(well.depth));
-    setSimDrought(well.drought || 3);
-    setSimPump(Math.round(well.pump));
-    setSimNatLvl(Math.round(well.nat_lvl));
-    setSimStabLvl(Math.round(well.stab_lvl));
-    setSimStorage(well.storage);
-    
-    // Auto-predict after load
-    const result = predictSuitability({
-      hydrogeology: well.hydro || 'f',
-      aquifer: well.aquifer || '충적',
-      water_quality_type: String(well.wq_type),
-      mean_well_depth: well.depth,
-      drought_vulnerability: well.drought,
-      mean_pumped_volume_per_day: well.pump,
-      mean_natural_water_level: well.nat_lvl,
-      mean_stable_water_level: well.stab_lvl,
-      mean_storage_coef: well.storage
-    });
-    setPredProbability(result.probability);
-    setPredLabel(result.label);
-  };
-
-  // Predict Simulation
-  const handleSimulate = (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSimulating(true);
-    
-    setTimeout(() => {
-      const result = predictSuitability({
-        hydrogeology: simHydro,
-        aquifer: simAquifer,
-        water_quality_type: simWqType,
-        mean_well_depth: simDepth,
-        drought_vulnerability: simDrought,
-        mean_pumped_volume_per_day: simPump,
-        mean_natural_water_level: simNatLvl,
-        mean_stable_water_level: simStabLvl,
-        mean_storage_coef: simStorage
-      });
-
-      setPredProbability(result.probability);
-      setPredLabel(result.label);
-      setIsSimulating(false);
-
-      if (result.label === 1) {
-        confetti({
-          particleCount: 140,
-          spread: 90,
-          origin: { y: 0.5, x: 0.2 },
-          colors: ['#10B981', '#34D399', '#3B82F6', '#06B6D4']
-        });
-      }
-    }, 450);
-  };
-
-  const handleSelectWell = (well: Well) => {
-    setSelectedWell(well);
-    setMapCenter([well.lat, well.lng]);
-    setMapZoom(13.5);
-    loadWellIntoSimulator(well);
-  };
+  const [suitabilityFilter, setSuitabilityFilter] = useState<SuitabilityFilter>('all');
+  const [input, setInput] = useState<PredictInput>(DEFAULT_INPUT);
+  const [mapZoom, setMapZoom] = useState(INITIAL_ZOOM);
+  const [openDropdown, setOpenDropdown] = useState<FilterDropdownId | null>(null);
 
   useEffect(() => {
-    // Initial run
-    const result = predictSuitability({
-      hydrogeology: simHydro,
-      aquifer: simAquifer,
-      water_quality_type: simWqType,
-      mean_well_depth: simDepth,
-      drought_vulnerability: simDrought,
-      mean_pumped_volume_per_day: simPump,
-      mean_natural_water_level: simNatLvl,
-      mean_stable_water_level: simStabLvl,
-      mean_storage_coef: simStorage
-    });
-    setPredProbability(result.probability);
-    setPredLabel(result.label);
+    let cancelled = false;
+
+    async function loadWells() {
+      try {
+        setLoadState('loading');
+        const response = await fetch(DATA_URL);
+        if (!response.ok) {
+          throw new Error(`데이터 요청 실패: ${response.status}`);
+        }
+
+        const data = (await response.json()) as Well[];
+        if (!Array.isArray(data)) {
+          throw new Error('관정 데이터 형식이 올바르지 않습니다.');
+        }
+
+        if (!cancelled) {
+          setWells(data);
+          setLoadState('ready');
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setLoadError(error instanceof Error ? error.message : '알 수 없는 로딩 오류');
+          setLoadState('error');
+        }
+      }
+    }
+
+    loadWells();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Compute stats for current filter
-  const totalCount = filteredWells.length;
-  const suitableCount = useMemo(() => {
-    return filteredWells.filter(w => w.pred === 1).length;
-  }, [filteredWells]);
-  const suitableRatio = totalCount > 0 ? (suitableCount / totalCount * 100).toFixed(1) : '0';
+  const provinceOptions = useMemo<DropdownOption<string>[]>(() => {
+    const counts = new Map<string, number>();
+    wells.forEach((well) => {
+      if (!well.prov) return;
+      counts.set(well.prov, (counts.get(well.prov) ?? 0) + 1);
+    });
+
+    return [
+      { value: '전체', label: '전국', meta: `${wells.length.toLocaleString()}개 후보` },
+      ...Array.from(counts.entries())
+        .sort(([a], [b]) => a.localeCompare(b, 'ko'))
+        .map(([province, count]) => ({
+          value: province,
+          label: province,
+          meta: `${count.toLocaleString()}개 후보`,
+        })),
+    ];
+  }, [wells]);
+
+  const suitabilityOptions = useMemo<DropdownOption<SuitabilityFilter>[]>(
+    () =>
+      FILTER_OPTIONS.map((option) => ({
+        ...option,
+        meta: FILTER_META[option.value],
+      })),
+    [],
+  );
+
+  const filteredWells = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+
+    return wells.filter((well) => {
+      const searchable = `${well.name} ${well.prov} ${well.city} ${well.town}`.toLowerCase();
+      const matchesSearch = query.length === 0 || searchable.includes(query);
+      const matchesProvince = provinceFilter === '전체' || well.prov === provinceFilter;
+
+      let matchesSuitability = true;
+      if (suitabilityFilter === 'suitable') matchesSuitability = well.pred === 1;
+      if (suitabilityFilter === 'unsuitable') matchesSuitability = well.pred === 0;
+      if (suitabilityFilter === 'actual-suitable') matchesSuitability = well.is_dev === 1;
+      if (suitabilityFilter === 'unknown') matchesSuitability = well.is_dev === -1;
+
+      return matchesSearch && matchesProvince && matchesSuitability;
+    });
+  }, [provinceFilter, searchQuery, suitabilityFilter, wells]);
+
+  const stats = useMemo(() => {
+    const suitable = filteredWells.filter((well) => well.pred === 1).length;
+    const actualSuitable = filteredWells.filter((well) => well.is_dev === 1).length;
+    const unknown = filteredWells.filter((well) => well.is_dev === -1).length;
+
+    return {
+      total: wells.length,
+      visible: filteredWells.length,
+      suitable,
+      actualSuitable,
+      unknown,
+      suitableRatio: filteredWells.length > 0 ? suitable / filteredWells.length : 0,
+    };
+  }, [filteredWells, wells.length]);
+
+  const mapVisual = useMemo(() => {
+    const mode = getDisplayMode(mapZoom, filteredWells.length);
+
+    if (mode === 'density') {
+      const clusters = buildClusterPoints(filteredWells, mapZoom);
+      return {
+        mode,
+        clusters,
+        points: [] as Well[],
+        displayedCount: clusters.length,
+        representedCount: filteredWells.length,
+      };
+    }
+
+    if (mode === 'priority') {
+      const points = buildPriorityWells(filteredWells, mapZoom);
+      return {
+        mode,
+        clusters: [] as ClusterPoint[],
+        points,
+        displayedCount: points.length,
+        representedCount: filteredWells.length,
+      };
+    }
+
+    return {
+      mode,
+      clusters: [] as ClusterPoint[],
+      points: filteredWells,
+      displayedCount: filteredWells.length,
+      representedCount: filteredWells.length,
+    };
+  }, [filteredWells, mapZoom]);
+
+  const prediction = useMemo(() => predictSuitability(input), [input]);
+  const impactRows = useMemo(
+    () => calculateImpactRows(input, prediction.probability),
+    [input, prediction.probability],
+  );
+  const maxImpact = Math.max(...impactRows.map((row) => Math.abs(row.delta)), 0.001);
+
+  const updateInput = useCallback(
+    <K extends keyof PredictInput>(key: K, value: PredictInput[K]) => {
+      setInput((current) => ({ ...current, [key]: value }));
+    },
+    [],
+  );
+
+  const loadWellIntoSimulator = useCallback((well: Well) => {
+    setInput(getInputFromWell(well));
+  }, []);
+
+  const handleSelectWell = useCallback(
+    (well: Well) => {
+      setSelectedWell(well);
+      loadWellIntoSimulator(well);
+    },
+    [loadWellIntoSimulator],
+  );
+
+  const clearSelection = useCallback(() => {
+    setSelectedWell(null);
+  }, []);
+
+  const scoreStyle = {
+    '--score-angle': `${prediction.probability * 360}deg`,
+  } as CSSProperties;
 
   return (
-    <div className="relative h-screen w-screen bg-[#060814] overflow-hidden font-sans">
-      
-      {/* BACKGROUND FULLSCREEN MAP */}
-      <div className="absolute inset-0 z-0">
-        <MapContainer 
-          center={mapCenter} 
-          zoom={mapZoom} 
-          preferCanvas={true} 
+    <main className="app-shell">
+      <section className="map-stage" aria-label="대한민국 지하수 저류댐 적합도 지도">
+        <MapContainer
+          center={INITIAL_CENTER}
+          zoom={INITIAL_ZOOM}
+          minZoom={6}
+          maxZoom={18}
+          preferCanvas
           zoomControl={false}
-          className="w-full h-full"
+          className="map-canvas"
         >
-          <ChangeView center={mapCenter} zoom={mapZoom} />
           <TileLayer
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-            attribution='&copy; <a href="https://carto.com/attributions">CARTO</a>'
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+            subdomains="abcd"
+            url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
           />
-
-          {filteredWells.slice(0, 18000).map((well) => {
-            let color = '#3B82F6';
-            let fillOpacity = 0.55;
-
-            if (well.is_dev === 1) {
-              color = '#10B981';
-              fillOpacity = 0.9;
-            } else if (well.is_dev === 0) {
-              color = '#EF4444';
-              fillOpacity = 0.9;
-            } else {
-              if (well.prob >= 0.7) {
-                color = '#34D399';
-                fillOpacity = 0.75;
-              } else if (well.prob <= 0.3) {
-                color = '#F87171';
-                fillOpacity = 0.75;
-              } else {
-                color = '#06B6D4';
-                fillOpacity = 0.5;
-              }
-            }
-
-            return (
-              <CircleMarker
-                key={well.id}
-                center={[well.lat, well.lng]}
-                radius={selectedWell?.id === well.id ? 8 : (mapZoom > 11 ? 5 : 2.5)}
-                pathOptions={{
-                  color: selectedWell?.id === well.id ? '#FFFFFF' : color,
-                  weight: selectedWell?.id === well.id ? 2.5 : 0.5,
-                  fillColor: color,
-                  fillOpacity: fillOpacity
-                }}
-                eventHandlers={{
-                  click: () => handleSelectWell(well)
-                }}
-              />
-            );
-          })}
+          <ZoomControl position="bottomright" />
+          <ChangeView selectedWell={selectedWell} />
+          <MapZoomReporter onZoomChange={setMapZoom} />
+          {loadState === 'ready' && (
+            <>
+              {mapVisual.mode === 'density' && (
+                <ClusterCanvasLayer clusters={mapVisual.clusters} />
+              )}
+              {mapVisual.mode !== 'density' && (
+                <WellCanvasLayer wells={mapVisual.points} onSelect={handleSelectWell} />
+              )}
+            </>
+          )}
+          {selectedWell && (
+            <CircleMarker
+              center={[selectedWell.lat, selectedWell.lng]}
+              radius={10}
+              pathOptions={{
+                color: '#0f766e',
+                fillColor: '#14b8a6',
+                fillOpacity: 0.9,
+                weight: 3,
+              }}
+            />
+          )}
         </MapContainer>
-      </div>
+        <div className="map-soft-light" />
+      </section>
 
-      {/* FLOATING TOP BAR: Search & High-Level Filters */}
-      <header className="absolute top-5 left-5 right-5 z-20 flex flex-wrap gap-3 pointer-events-none">
-        
-        {/* Search */}
-        <div className="flex-1 min-w-[280px] max-w-[400px] floating-glass p-2.5 flex items-center gap-3 pointer-events-auto">
-          <Search className="w-4.5 h-4.5 text-gray-400 ml-1.5" />
-          <input 
-            type="text" 
-            placeholder="지하수 관정명 또는 도시 검색..." 
+      <header className="top-bar liquid-panel">
+        <div className="brand-block">
+          <div className="brand-icon">
+            <Droplet size={22} />
+          </div>
+          <div>
+            <p className="eyebrow">XGBoost Siting Suitability</p>
+            <h1>지하수 저류댐 입지 적합도</h1>
+          </div>
+        </div>
+
+        <label className="search-box">
+          <Search size={18} />
+          <input
+            type="search"
             value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="bg-transparent border-none text-white focus:outline-none w-full text-sm placeholder-gray-500 font-medium"
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="관정명, 시군구, 읍면동 검색"
+            aria-label="관정명 또는 지역 검색"
           />
-          {searchQuery && (
-            <button onClick={() => setSearchQuery('')} className="p-0.5 hover:bg-white/10 rounded-full transition-colors">
-              <X className="w-3.5 h-3.5 text-gray-400" />
+          {searchQuery.length > 0 && (
+            <button type="button" className="icon-button" onClick={() => setSearchQuery('')} aria-label="검색어 지우기">
+              <X size={16} />
+            </button>
+          )}
+        </label>
+
+        <div className="filter-row" aria-label="지도 필터">
+          <FilterDropdown
+            id="province"
+            label="지역"
+            icon={<MapPin size={16} />}
+            value={provinceFilter}
+            options={provinceOptions}
+            openDropdown={openDropdown}
+            onOpenChange={setOpenDropdown}
+            onChange={setProvinceFilter}
+          />
+
+          <FilterDropdown
+            id="suitability"
+            label="표시 기준"
+            icon={<Filter size={16} />}
+            value={suitabilityFilter}
+            options={suitabilityOptions}
+            openDropdown={openDropdown}
+            onOpenChange={setOpenDropdown}
+            onChange={setSuitabilityFilter}
+          />
+        </div>
+      </header>
+
+      <aside className="predict-panel liquid-panel" aria-label="입지 적합도 예측 패널">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Interactive Model</p>
+            <h2>가상 입지 시뮬레이터</h2>
+          </div>
+          <Cpu size={22} />
+        </div>
+
+        <div className="panel-scroll">
+          <section className={`prediction-card ${prediction.label === 1 ? 'is-suitable' : 'is-unsuitable'}`}>
+            <div className="score-ring" style={scoreStyle}>
+              <div>
+                <strong>{formatPercent(prediction.probability)}</strong>
+                <span>적합 확률</span>
+              </div>
+            </div>
+            <div className="prediction-copy">
+              <p className="eyebrow">현재 입력값 예측</p>
+              <h3>{prediction.label === 1 ? '입지 적합 가능성이 높음' : '입지 적합 가능성이 낮음'}</h3>
+              <p>
+                XGBoost 추론 엔진이 브라우저에서 입력 변수를 즉시 평가합니다.
+              </p>
+            </div>
+          </section>
+
+          <form className="control-stack" onSubmit={(event) => event.preventDefault()}>
+            <div className="section-title">
+              <Sliders size={16} />
+              <span>모델 입력 변수</span>
+            </div>
+
+            <div className="field-grid two-columns">
+              <label className="control-field">
+                <span>수문지질</span>
+                <select
+                  value={input.hydrogeology}
+                  onChange={(event) => updateInput('hydrogeology', event.target.value)}
+                >
+                  {OHE_CATEGORIES[0].map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="control-field">
+                <span>대수층</span>
+                <select
+                  value={input.aquifer}
+                  onChange={(event) => updateInput('aquifer', event.target.value)}
+                >
+                  {OHE_CATEGORIES[1].map((option) => (
+                    <option key={option} value={option}>
+                      {option}층
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="field-grid two-columns">
+              <label className="control-field">
+                <span>수질 군집</span>
+                <select
+                  value={input.water_quality_type}
+                  onChange={(event) => updateInput('water_quality_type', event.target.value)}
+                >
+                  {OHE_CATEGORIES[2].map((option) => (
+                    <option key={option} value={option}>
+                      유형 {option}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="control-field">
+                <span>저류계수 측정</span>
+                <select
+                  value={input.mean_storage_coef}
+                  onChange={(event) => updateInput('mean_storage_coef', Number(event.target.value))}
+                >
+                  <option value={1}>측정 완료</option>
+                  <option value={0}>미측정</option>
+                </select>
+              </label>
+            </div>
+
+            <label className="range-field">
+              <span>
+                관정 깊이 <strong>{input.mean_well_depth} m</strong>
+              </span>
+              <input
+                type="range"
+                min={5}
+                max={250}
+                value={input.mean_well_depth}
+                onChange={(event) => updateInput('mean_well_depth', Number(event.target.value))}
+              />
+            </label>
+
+            <label className="range-field">
+              <span>
+                평균 양수량 <strong>{input.mean_pumped_volume_per_day} m³/d</strong>
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={1500}
+                step={10}
+                value={input.mean_pumped_volume_per_day}
+                onChange={(event) => updateInput('mean_pumped_volume_per_day', Number(event.target.value))}
+              />
+            </label>
+
+            <label className="range-field">
+              <span>
+                자연수위 <strong>{input.mean_natural_water_level} m</strong>
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={60}
+                value={input.mean_natural_water_level}
+                onChange={(event) => updateInput('mean_natural_water_level', Number(event.target.value))}
+              />
+            </label>
+
+            <label className="range-field">
+              <span>
+                안정수위 <strong>{input.mean_stable_water_level} m</strong>
+              </span>
+              <input
+                type="range"
+                min={0}
+                max={80}
+                value={input.mean_stable_water_level}
+                onChange={(event) => updateInput('mean_stable_water_level', Number(event.target.value))}
+              />
+            </label>
+
+            <label className="control-field">
+              <span>가뭄 취약 등급</span>
+              <select
+                value={input.drought_vulnerability}
+                onChange={(event) => updateInput('drought_vulnerability', Number(event.target.value))}
+              >
+                {[0, 1, 2, 3, 4, 5].map((grade) => (
+                  <option key={grade} value={grade}>
+                    {grade === 0 ? '미상' : `${grade} 등급`}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <div className="button-row">
+              <button type="button" className="ghost-button" onClick={() => setInput(DEFAULT_INPUT)}>
+                <RefreshCw size={16} />
+                기본값
+              </button>
+              {selectedWell && (
+                <button type="button" className="primary-button" onClick={() => loadWellIntoSimulator(selectedWell)}>
+                  선택 지점 예측에 불러오기
+                </button>
+              )}
+            </div>
+          </form>
+
+          <section className="xai-card" aria-label="XAI-lite 변수 민감도">
+            <div className="section-title">
+              <BarChart2 size={16} />
+              <span>XAI-lite 변수 민감도</span>
+            </div>
+            <p className="helper-copy">
+              각 변수를 기준값으로 바꿨을 때 현재 확률이 얼마나 달라지는지 계산한 값입니다.
+            </p>
+            <div className="impact-list">
+              {impactRows.slice(0, 6).map((row) => {
+                const width = Math.max((Math.abs(row.delta) / maxImpact) * 100, 4);
+                const style = { '--impact-width': `${width}%` } as CSSProperties;
+                return (
+                  <div key={row.key} className="impact-row">
+                    <div className="impact-label">
+                      <span>{row.label}</span>
+                      <strong>
+                        {row.delta >= 0 ? '+' : ''}
+                        {(row.delta * 100).toFixed(1)}%p
+                      </strong>
+                    </div>
+                    <div className="impact-track">
+                      <div
+                        className={`impact-bar ${row.delta >= 0 ? 'positive' : 'negative'}`}
+                        style={style}
+                      />
+                    </div>
+                    <small>기준값: {row.baselineText}</small>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        </div>
+      </aside>
+
+      <aside className="detail-panel liquid-panel" aria-label="선택 지점 상세 정보">
+        <div className="panel-header">
+          <div>
+            <p className="eyebrow">Selected Groundwater</p>
+            <h2>지점 상세</h2>
+          </div>
+          {selectedWell && (
+            <button type="button" className="icon-button" onClick={clearSelection} aria-label="선택 지점 닫기">
+              <X size={18} />
             </button>
           )}
         </div>
 
-        {/* Filters Panel */}
-        <div className="flex items-center gap-2 pointer-events-auto">
-          {/* Province Filter */}
-          <div className="floating-glass py-2.5 px-3.5 flex items-center gap-2 text-xs font-semibold">
-            <MapPin className="w-4 h-4 text-blue-400" />
-            <select 
-              value={provinceFilter} 
-              onChange={(e) => setProvinceFilter(e.target.value)}
-              className="bg-transparent border-none text-white focus:outline-none pr-5 cursor-pointer"
-            >
-              {provinces.map(p => (
-                <option key={p} value={p} className="bg-[#0D1324]">{p === '전체' ? '행정구역: 전체' : p}</option>
-              ))}
-            </select>
-          </div>
+        {selectedWell ? (
+          <div className="panel-scroll">
+            <section className="selected-summary">
+              <span className="status-pill">{getLabelText(selectedWell)}</span>
+              <h3>{selectedWell.name}</h3>
+              <p>
+                <MapPin size={15} />
+                {[selectedWell.prov, selectedWell.city, selectedWell.town].filter(Boolean).join(' ')}
+              </p>
+              <div className="selected-score">
+                <strong>{formatPercent(selectedWell.prob)}</strong>
+                <span>사전 계산 적합도</span>
+              </div>
+            </section>
 
-          {/* Suitability Filter */}
-          <div className="floating-glass py-2.5 px-3.5 flex items-center gap-2 text-xs font-semibold">
-            <Filter className="w-4 h-4 text-blue-400" />
-            <select 
-              value={suitabilityFilter} 
-              onChange={(e) => setSuitabilityFilter(e.target.value)}
-              className="bg-transparent border-none text-white focus:outline-none pr-5 cursor-pointer"
-            >
-              <option value="전체" className="bg-[#0D1324]">적합도 판정: 전체</option>
-              <option value="적합" className="bg-[#0D1324]">적합 판정지 (전체)</option>
-              <option value="부적합" className="bg-[#0D1324]">부적합 판정지 (전체)</option>
-              <option value="실제적합" className="bg-[#0D1324]">실제 적합 판정지 (Labeled)</option>
-              <option value="미판정" className="bg-[#0D1324]">미판정 예측 대상지 (Unlabeled)</option>
-            </select>
-          </div>
-        </div>
+            <section className="metric-grid">
+              <div className="metric-card">
+                <span>관정 깊이</span>
+                <strong>{formatNumber(selectedWell.depth)} m</strong>
+              </div>
+              <div className="metric-card">
+                <span>평균 양수량</span>
+                <strong>{formatNumber(selectedWell.pump)} m³/d</strong>
+              </div>
+              <div className="metric-card">
+                <span>자연수위</span>
+                <strong>{formatNumber(selectedWell.nat_lvl)} m</strong>
+              </div>
+              <div className="metric-card">
+                <span>안정수위</span>
+                <strong>{formatNumber(selectedWell.stab_lvl)} m</strong>
+              </div>
+              <div className="metric-card">
+                <span>가뭄 등급</span>
+                <strong>{selectedWell.drought || '미상'}</strong>
+              </div>
+              <div className="metric-card">
+                <span>저류계수</span>
+                <strong>{selectedWell.storage === 1 ? '측정 완료' : '미측정'}</strong>
+              </div>
+            </section>
 
-        {/* Global Statistics Pill */}
-        <div className="floating-glass py-2 px-4 flex items-center gap-4 text-xs ml-auto pointer-events-auto">
-          <div className="flex items-center gap-2">
-            <span className="text-gray-400">검색 대상 관정:</span>
-            <span className="font-mono font-bold text-white text-sm">{totalCount.toLocaleString()}</span>
-          </div>
-          <div className="w-px h-4 bg-white/10" />
-          <div className="flex items-center gap-2">
-            <span className="text-gray-400">적합 비중:</span>
-            <span className="font-mono font-bold text-emerald-400 text-sm">{suitableRatio}%</span>
-          </div>
-        </div>
-
-      </header>
-
-      {/* FLOATING LEFT SIDEBAR PANEL: Simulator */}
-      <aside className="absolute left-5 top-24 bottom-5 w-[380px] z-10 flex flex-col gap-5 pointer-events-none">
-        
-        {/* Main Glass Control Card */}
-        <div className="floating-glass w-full flex-1 flex flex-col pointer-events-auto overflow-hidden">
-          
-          {/* Header */}
-          <div className="p-5 border-b border-white/10 flex items-center justify-between bg-white/[0.01]">
-            <div className="flex items-center gap-2.5">
-              <div className="p-2 bg-blue-600/10 rounded-lg border border-blue-500/20">
-                <Droplet className="w-5 h-5 text-blue-400 fill-blue-400/10" />
+            <section className="profile-list">
+              <div>
+                <span>수문지질</span>
+                <strong>{selectedWell.hydro || '-'}</strong>
               </div>
               <div>
-                <h2 className="text-md font-bold font-display tracking-tight text-white">지하수 저류댐 분석</h2>
-                <p className="text-[10px] text-gray-400 font-semibold tracking-wider uppercase">Siting Suitability Engine</p>
+                <span>대수층</span>
+                <strong>{selectedWell.aquifer || '-'}</strong>
               </div>
-            </div>
-            <Sparkles className="w-4 h-4 text-yellow-400 animate-pulse" />
-          </div>
-
-          {/* Form Scroll Area */}
-          <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6">
-            
-            <div className="flex items-center gap-2 pb-1 border-b border-white/5">
-              <Sliders className="w-3.5 h-3.5 text-blue-400" />
-              <h3 className="text-[11px] font-bold uppercase tracking-wider text-blue-400">가상 입지 시뮬레이터</h3>
-            </div>
-
-            <form onSubmit={handleSimulate} className="flex flex-col gap-4">
-              
-              {/* Sliders Grid */}
-              <div className="flex flex-col gap-4">
-                {/* Mean Well Depth */}
-                <div className="bg-white/[0.02] border border-white/5 p-3.5 rounded-xl">
-                  <div className="flex justify-between items-center mb-2">
-                    <label className="input-label">평균 관정 깊이</label>
-                    <span className="text-xs text-white font-mono font-bold">{simDepth} m</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="5" 
-                    max="250" 
-                    value={simDepth} 
-                    onChange={(e) => setSimDepth(Number(e.target.value))} 
-                  />
-                </div>
-
-                {/* Pumping volume */}
-                <div className="bg-white/[0.02] border border-white/5 p-3.5 rounded-xl">
-                  <div className="flex justify-between items-center mb-2">
-                    <label className="input-label">하루 평균 양수량</label>
-                    <span className="text-xs text-white font-mono font-bold">{simPump} m³/d</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="0" 
-                    max="1500" 
-                    value={simPump} 
-                    onChange={(e) => setSimPump(Number(e.target.value))} 
-                  />
-                </div>
-
-                {/* Natural water level */}
-                <div className="bg-white/[0.02] border border-white/5 p-3.5 rounded-xl">
-                  <div className="flex justify-between items-center mb-2">
-                    <label className="input-label">자연 지하수 수위</label>
-                    <span className="text-xs text-white font-mono font-bold">{simNatLvl} m</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="0" 
-                    max="60" 
-                    value={simNatLvl} 
-                    onChange={(e) => setSimNatLvl(Number(e.target.value))} 
-                  />
-                </div>
-
-                {/* Stable water level */}
-                <div className="bg-white/[0.02] border border-white/5 p-3.5 rounded-xl">
-                  <div className="flex justify-between items-center mb-2">
-                    <label className="input-label">안정 지하수 수위</label>
-                    <span className="text-xs text-white font-mono font-bold">{simStabLvl} m</span>
-                  </div>
-                  <input 
-                    type="range" 
-                    min="0" 
-                    max="80" 
-                    value={simStabLvl} 
-                    onChange={(e) => setSimStabLvl(Number(e.target.value))} 
-                  />
-                </div>
+              <div>
+                <span>수질 군집</span>
+                <strong>유형 {selectedWell.wq_type}</strong>
               </div>
-
-              {/* Multi inputs block */}
-              <div className="bg-white/[0.02] border border-white/5 p-4 rounded-xl flex flex-col gap-4">
-                
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="input-label">가뭄 취약 등급</label>
-                    <select 
-                      className="glass-input" 
-                      value={simDrought} 
-                      onChange={(e) => setSimDrought(Number(e.target.value))}
-                    >
-                      {[1, 2, 3, 4, 5].map(v => (
-                        <option key={v} value={v} className="bg-[#0D1324]">{v} 등급</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="input-label">저류계수 측정</label>
-                    <select 
-                      className="glass-input" 
-                      value={simStorage} 
-                      onChange={(e) => setSimStorage(Number(e.target.value))}
-                    >
-                      <option value={1} className="bg-[#0D1324]">측정 완료</option>
-                      <option value={0} className="bg-[#0D1324]">미측정</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="input-label">대수층 형태 (Aquifer)</label>
-                  <select 
-                    className="glass-input" 
-                    value={simAquifer} 
-                    onChange={(e) => setSimAquifer(e.target.value)}
-                  >
-                    {['충적', '암반', '용천수', '지표수', '샘물'].map(v => (
-                      <option key={v} value={v} className="bg-[#0D1324]">{v}층</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="input-label">수문지질 특성</label>
-                    <select 
-                      className="glass-input" 
-                      value={simHydro} 
-                      onChange={(e) => setSimHydro(e.target.value)}
-                    >
-                      {['a', 'b', 'c', 'd', 'e-1', 'e-2', 'f', 'g', 'h-1', 'h-2', '수류지역'].map(v => (
-                        <option key={v} value={v} className="bg-[#0D1324]">{v}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="input-label">화학 수질 군집</label>
-                    <select 
-                      className="glass-input" 
-                      value={simWqType} 
-                      onChange={(e) => setSimWqType(e.target.value)}
-                    >
-                      {[-1, 0, 1, 3, 4, 5, 8, 11, 16, 17, 18, 19, 41, 64].map(v => (
-                        <option key={v} value={v} className="bg-[#0D1324]">유형 {v}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
+              <div>
+                <span>좌표</span>
+                <strong>
+                  {selectedWell.lat.toFixed(4)}, {selectedWell.lng.toFixed(4)}
+                </strong>
               </div>
+            </section>
 
-              {/* Simulation Trigger button */}
-              <button 
-                type="submit" 
-                disabled={isSimulating}
-                className="w-full mt-1 py-3.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white text-xs font-bold uppercase tracking-wider rounded-xl flex items-center justify-center gap-2.5 shadow-lg shadow-blue-600/20 active:scale-[0.98] transition-all duration-200"
-              >
-                {isSimulating ? (
-                  <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>예측 모델 연산 가동 중...</span>
-                  </>
-                ) : (
-                  <>
-                    <Cpu className="w-4 h-4" />
-                    <span>입지 타당성 시뮬레이션 실행</span>
-                  </>
-                )}
-              </button>
-            </form>
-
-            {/* Results visualization block */}
-            {predProbability !== null && predLabel !== null && (
-              <div className={`p-4 rounded-xl border flex items-center gap-4 glass-panel fade-in transition-all duration-300 ${
-                predLabel === 1 
-                  ? 'border-emerald-500/20 bg-emerald-950/5 glow-suitable' 
-                  : 'border-red-500/20 bg-red-950/5'
-              }`}>
-                {/* Conic progress gauge */}
-                <div 
-                  className="circular-progress shrink-0" 
-                  style={{
-                    '--gauge-percent': `${predProbability * 360}deg`,
-                    '--gauge-color': predLabel === 1 ? 'var(--neon-emerald)' : 'var(--neon-coral)',
-                    '--gauge-glow': predLabel === 1 ? 'var(--neon-emerald-glow)' : 'var(--neon-coral-glow)'
-                  } as React.CSSProperties}
-                >
-                  <div className="circular-progress-inner">
-                    <span className="text-[15px] font-mono font-extrabold text-white leading-none">
-                      {Math.round(predProbability * 100)}
-                    </span>
-                    <span className="text-[8px] text-gray-400 font-semibold tracking-wider mt-0.5">%</span>
-                  </div>
-                </div>
-
-                {/* Score details */}
-                <div className="flex-1 flex flex-col gap-1">
-                  <div className="flex items-center gap-1.5">
-                    {predLabel === 1 ? (
-                      <div className="w-2 h-2 rounded-full bg-emerald-400" />
-                    ) : (
-                      <div className="w-2 h-2 rounded-full bg-red-400" />
-                    )}
-                    <span className="text-xs uppercase tracking-wider text-gray-400 font-semibold">예측 결과</span>
-                  </div>
-                  <h4 className={`text-md font-bold font-display ${predLabel === 1 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {predLabel === 1 ? '지하수 저류댐 적합' : '수치상 설치 부적합'}
-                  </h4>
-                  <p className="text-[10px] text-gray-500 font-medium">
-                    {predLabel === 1 
-                      ? '수문지질 및 수질 화학 특성이 저류 댐 입지 기준에 부합합니다.' 
-                      : '자연/안정 수위 편차 및 저류 능력이 부족한 환경입니다.'}
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-
-      </aside>
-
-      {/* FLOATING RIGHT INSPECTOR DRAWERS */}
-      <aside className="absolute right-5 top-24 bottom-5 w-[360px] z-10 flex flex-col gap-5 pointer-events-none">
-        
-        {selectedWell ? (
-          <div className="floating-glass w-full h-full flex flex-col pointer-events-auto overflow-hidden slide-in-right">
-            
-            {/* Header / Dismiss */}
-            <div className="p-5 border-b border-white/10 flex items-center justify-between bg-white/[0.01]">
-              <div className="flex items-center gap-2">
-                <BarChart2 className="w-5 h-5 text-blue-400" />
-                <h2 className="text-sm font-bold uppercase tracking-wider text-white">상세 데이터 분석기</h2>
-              </div>
-              <button 
-                onClick={() => setSelectedWell(null)} 
-                className="p-1 hover:bg-white/10 rounded-lg text-gray-400 hover:text-white transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Content list */}
-            <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-6">
-              
-              {/* Title Location Card */}
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[9px] uppercase tracking-wider font-extrabold text-blue-400 bg-blue-500/10 px-2 py-0.5 rounded w-max">
-                  후보지 #{selectedWell.id}
-                </span>
-                <h3 className="text-lg font-bold text-white leading-snug">{selectedWell.name}</h3>
-                <div className="flex items-center gap-1.5 text-xs text-gray-400 mt-0.5">
-                  <MapPin className="w-3.5 h-3.5 text-gray-500 shrink-0" />
-                  <span>{selectedWell.prov} {selectedWell.city} {selectedWell.town}</span>
-                </div>
-              </div>
-
-              {/* Glow decision card */}
-              <div className={`p-4 rounded-xl border flex items-center gap-4 ${
-                selectedWell.pred === 1 
-                  ? 'border-emerald-500/20 bg-emerald-950/5 glow-suitable' 
-                  : 'border-red-500/20 bg-red-950/5'
-              }`}>
-                {/* Conic progress gauge */}
-                <div 
-                  className="circular-progress shrink-0" 
-                  style={{
-                    '--gauge-percent': `${selectedWell.prob * 360}deg`,
-                    '--gauge-color': selectedWell.pred === 1 ? 'var(--neon-emerald)' : 'var(--neon-coral)',
-                    '--gauge-glow': selectedWell.pred === 1 ? 'var(--neon-emerald-glow)' : 'var(--neon-coral-glow)'
-                  } as React.CSSProperties}
-                >
-                  <div className="circular-progress-inner">
-                    <span className="text-[15px] font-mono font-extrabold text-white leading-none">
-                      {Math.round(selectedWell.prob * 100)}
-                    </span>
-                    <span className="text-[8px] text-gray-400 font-semibold tracking-wider mt-0.5">%</span>
-                  </div>
-                </div>
-
-                <div className="flex flex-col gap-1">
-                  <div className="flex justify-between items-center">
-                    <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase ${
-                      selectedWell.is_dev === -1 
-                        ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' 
-                        : 'bg-yellow-500/10 text-yellow-400 border border-yellow-500/20'
-                    }`}>
-                      {selectedWell.is_dev === -1 ? '모델 예측 후보' : '검증 실측 관정'}
-                    </span>
-                  </div>
-                  <h4 className={`text-md font-bold font-display ${
-                    selectedWell.pred === 1 ? 'text-emerald-400' : 'text-red-400'
-                  }`}>
-                    {selectedWell.pred === 1 ? '저류댐 입지 적합' : '입지 부적합 판정'}
-                  </h4>
-                </div>
-              </div>
-
-              {/* Physical Parameters List */}
-              <div className="flex flex-col gap-3">
-                <div className="flex items-center gap-1.5 pb-2 border-b border-white/5">
-                  <Sliders className="w-3.5 h-3.5 text-blue-400" />
-                  <h4 className="text-[11px] font-bold uppercase tracking-wider text-gray-400">수문지질 물리 지표</h4>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  
-                  {/* Well Depth */}
-                  <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex flex-col gap-0.5">
-                    <span className="text-[10px] text-gray-400 font-semibold uppercase">관정 평균 깊이</span>
-                    <span className="text-white font-mono font-bold text-sm">{selectedWell.depth.toFixed(1)} m</span>
-                  </div>
-
-                  {/* Pump Capacity */}
-                  <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex flex-col gap-0.5">
-                    <span className="text-[10px] text-gray-400 font-semibold uppercase">하루 평균 양수량</span>
-                    <span className="text-white font-mono font-bold text-sm">{selectedWell.pump.toFixed(1)} m³/d</span>
-                  </div>
-
-                  {/* Natural level */}
-                  <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex flex-col gap-0.5">
-                    <span className="text-[10px] text-gray-400 font-semibold uppercase">자연 지하 수위</span>
-                    <span className="text-white font-mono font-bold text-sm">{selectedWell.nat_lvl.toFixed(1)} m</span>
-                  </div>
-
-                  {/* Stable level */}
-                  <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex flex-col gap-0.5">
-                    <span className="text-[10px] text-gray-400 font-semibold uppercase">안정 지하 수위</span>
-                    <span className="text-white font-mono font-bold text-sm">{selectedWell.stab_lvl.toFixed(1)} m</span>
-                  </div>
-
-                  {/* Drought */}
-                  <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex flex-col gap-0.5">
-                    <span className="text-[10px] text-gray-400 font-semibold uppercase">가뭄 취약 등급</span>
-                    <span className="text-white font-bold text-sm">{selectedWell.drought} 등급</span>
-                  </div>
-
-                  {/* Storage */}
-                  <div className="p-3 bg-white/[0.02] border border-white/5 rounded-xl flex flex-col gap-0.5">
-                    <span className="text-[10px] text-gray-400 font-semibold uppercase">저류 계수</span>
-                    <span className="text-white font-bold text-sm">{selectedWell.storage === 1 ? '측정 완료' : '미측정'}</span>
-                  </div>
-
-                </div>
-              </div>
-
-              {/* Geological Properties */}
-              <div className="flex flex-col gap-3">
-                <div className="flex items-center gap-1.5 pb-2 border-b border-white/5">
-                  <Info className="w-3.5 h-3.5 text-blue-400" />
-                  <h4 className="text-[11px] font-bold uppercase tracking-wider text-gray-400">지하지반 및 화학 군집 프로필</h4>
-                </div>
-
-                <div className="flex flex-col gap-2">
-                  <div className="flex justify-between items-center p-3 bg-white/[0.02] rounded-xl border border-white/5 text-xs">
-                    <span className="text-gray-400 font-semibold">대수층 형태 (Aquifer)</span>
-                    <span className="font-bold text-white">{selectedWell.aquifer}층</span>
-                  </div>
-
-                  <div className="flex justify-between items-center p-3 bg-white/[0.02] rounded-xl border border-white/5 text-xs">
-                    <span className="text-gray-400 font-semibold">수문지질 특성 (Hydro)</span>
-                    <span className="font-bold text-white">{selectedWell.hydro}</span>
-                  </div>
-
-                  <div className="flex justify-between items-center p-3 bg-white/[0.02] rounded-xl border border-white/5 text-xs">
-                    <span className="text-gray-400 font-semibold">수질 화학 군집 분류</span>
-                    <span className="font-mono font-bold text-blue-400">유형 {selectedWell.wq_type}</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Load Sandbox Button */}
-              <button 
-                onClick={() => loadWellIntoSimulator(selectedWell)}
-                className="w-full mt-auto py-3 border border-blue-500/25 bg-blue-500/5 hover:bg-blue-500/10 text-blue-400 text-xs font-bold uppercase tracking-wider rounded-xl flex items-center justify-center gap-2 transition-all duration-200 active:scale-[0.98]"
-              >
-                <Sliders className="w-3.5 h-3.5" />
-                <span>시뮬레이터에 파라미터 로드</span>
-              </button>
-
-            </div>
-
+            <button type="button" className="primary-button wide" onClick={() => loadWellIntoSimulator(selectedWell)}>
+              선택 지점 예측에 불러오기
+            </button>
           </div>
         ) : (
-          <div className="floating-glass w-full p-6 flex flex-col items-center justify-center text-center text-gray-500 gap-3 border-dashed">
-            <div className="p-3 bg-white/[0.02] border border-white/5 rounded-full">
-              <Info className="w-6 h-6 text-gray-400 stroke-[1.5]" />
-            </div>
-            <div>
-              <h3 className="text-sm font-bold text-white mb-1">관정 상세 분석기</h3>
-              <p className="text-xs text-gray-400 leading-normal">
-                대한민국 지도에서 후보 관정 점을 클릭하면 해당 입지의 상세 물리·화학 데이터를 즉시 분석할 수 있습니다.
-              </p>
-            </div>
+          <div className="empty-state">
+            <Info size={30} />
+            <h3>지도 위 점을 선택하세요</h3>
+            <p>마우스를 올리면 적합도 요약이 보이고, 클릭하면 상세 지표와 예측 입력값을 확인할 수 있습니다.</p>
           </div>
         )}
-
       </aside>
 
-    </div>
+      <section className="status-strip liquid-panel" aria-live="polite">
+        {loadState === 'loading' && (
+          <>
+            <RefreshCw size={16} className="spin" />
+            <span>관정 데이터 로딩 중</span>
+          </>
+        )}
+        {loadState === 'error' && (
+          <>
+            <Info size={16} />
+            <span>{loadError}</span>
+          </>
+        )}
+        {loadState === 'ready' && (
+          <>
+            <Droplet size={16} />
+            <span className="mode-pill">{getDisplayModeLabel(mapVisual.mode)}</span>
+            {' '}
+            <span>
+              전체 {stats.total.toLocaleString()}개 중 필터 결과 {stats.visible.toLocaleString()}개 · 지도 표시{' '}
+              {mapVisual.displayedCount.toLocaleString()}개 · 적합 예측 {stats.suitable.toLocaleString()}개 (
+              {formatPercent(stats.suitableRatio)})
+            </span>
+          </>
+        )}
+        {loadState === 'ready' && filteredWells.length === 0 && <strong>필터 조건에 맞는 지점이 없습니다.</strong>}
+      </section>
+    </main>
   );
 }
